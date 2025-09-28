@@ -1,0 +1,73 @@
+1️⃣ Mục tiêu dự án
+
+Xây dựng API OEE phục vụ dashboard trên AVEVA Edge.
+
+API lấy dữ liệu từ MySQL (fact_production_min, dim_packaging, dim_shift_calendar) và trả về JSON gồm:
+
+Gauges (Availability, Performance, Quality, OEE)
+
+Linechart (bucket tự động ≤ 2000 điểm)
+
+Summaries (shift/day/week/month/quarter/year).
+
+Đảm bảo chạy ổn định, tránh NaN/Inf gây lỗi JSON, hỗ trợ cache TTL để nhiều widget gọi đồng thời.
+
+2️⃣ Các cải tiến đã làm
+
+Tách nhỏ code & logging rõ ràng (docstring, comments, log cho từng bước).
+
+Thêm CORS cho client (AVEVA, LAN).
+
+Bổ sung cache TTL theo (line_id, time range, bucket_sec) để tái sử dụng kết quả.
+
+Thêm endpoint /oee/dashboard/line/{line_id} gom snapshot đầy đủ (gauges + linechart + 6 summaries).
+
+Xử lý tự động bucket trong build_sql_range để giới hạn số điểm linechart.
+
+Viết lại công thức OEE = APQ với ngoặc chuẩn → không lỗi SQL.
+
+Fix lỗi MySQL ONLY_FULL_GROUP_BY cho view (quarter, month, …).
+
+Xử lý NaN/Inf ở 2 lớp:
+
+Trong _df_to_records (DataFrame → JSON).
+
+Thêm _sanitize_json_deep làm “lưới an toàn” trước khi trả response.
+
+3️⃣ Tồn tại & hướng tiếp theo
+
+Cần finalize hàm _build_sql_range cho range/gran mode thật sạch (hiện đã ổn, chỉ cần kiểm thử thêm).
+
+Kiểm tra lại key trả JSON (linechart thống nhất, bỏ linchart).
+
+Tối ưu thêm: có thể gom API call và cache nhiều hơn (tránh query DB lặp).
+
+Bổ sung test cases:
+
+since_min ngắn (có NaN),
+
+from/to dài (bucket auto),
+
+filter theo process_order, packaging_id.
+
+4️⃣ Điểm mốc để bắt đầu topic mới
+
+Chúng ta đã có 3 block code chính:
+
+Helpers, sanitize, cache
+
+/oee/line/{line_id} (range/gran mode)
+
+/oee/dashboard/line/{line_id} (snapshot đầy đủ)
+
+Vấn đề lớn nhất đã giải quyết: NaN gây lỗi JSON, ngoặc SQL sai, view quarter lỗi.
+
+Giờ có thể bắt đầu topic mới với focus:
+
+Refactor code thành module tách biệt (vd: queries.py, utils.py, api.py)
+
+Tối ưu hiệu năng query (index, partition)
+
+Bổ sung unit test và Postman collection để verify kết quả.
+
+👉 Tóm gọn: API OEE đã chạy ổn cho from/to, cần hoàn thiện nốt gran mode (since_min) và dọn code thành cấu trúc chuẩn để dễ mở rộng.

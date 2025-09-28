@@ -1,0 +1,83 @@
+3) Cách chạy nhanh (Windows)
+:: Tạo venv & cài gói
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+
+:: Chạy API
+set DB_URL=mysql+mysqlconnector://root:root@127.0.0.1:3306/mpy_oee
+uvicorn api_oee:app --host 0.0.0.0 --port 8088 --reload
+
+
+Kiểm tra: http://localhost:8088/health
+
+Lấy dữ liệu:
+
+phút 4 giờ gần nhất:
+http://localhost:8088/oee/line/105?gran=min&since_min=240
+
+theo ca với filter PO:
+http://localhost:8088/oee/line/105?gran=shift&process_order=ABC
+
+theo ngày với filter packaging:
+http://localhost:8088/oee/line/105?gran=day&packaging_id=3
+
+Cách A (khuyên dùng): Task Scheduler gọi Python trực tiếp
+
+Xác định đường dẫn Python (venv 64-bit) và file job:
+
+Python: C:\OEE\venv\Scripts\python.exe
+
+Job: C:\OEE\jobs\oee_job.py
+
+(Tuỳ chọn) đặt biến môi trường ngay trong Task:
+
+DB_URL=mysql+mysqlconnector://root:root@127.0.0.1:3306/mpy_oee
+
+LOOKBACK_HOURS=4
+
+LOG_FILE=C:\OEE\logs\oee_job.log
+
+LOG_LEVEL=INFO
+
+Mở Task Scheduler → Create Task…
+
+General:
+
+Name: MPY_OEE_MinuteJob
+
+“Run whether user is logged on or not”
+
+“Run with highest privileges”
+
+Triggers:
+
+New… → Begin the task: On a schedule
+
+Daily → Repeat task every: 1 minute, for a duration of: Indefinitely
+
+Enabled
+
+Actions:
+
+New… → Start a program
+
+Program/script: C:\OEE\venv\Scripts\python.exe
+
+Add arguments: C:\OEE\jobs\oee_job.py
+
+Start in (optional): C:\OEE\jobs
+
+Conditions: bỏ chọn “Start the task only if the computer is on AC power” (tùy bạn)
+
+Settings:
+
+✔ “Allow task to be run on demand”
+
+✔ “If the task fails, restart every 1 minute” (3 attempts)
+
+✔ “Stop the task if it runs longer than” → 2 minutes
+
+“If the task is already running, then the following rule applies:” → Do not start a new instance (ngăn chồng chéo nếu lần trước chưa xong)
+
+Là xong. oee_job.py hiện đã viết theo kiểu chạy một lượt rồi thoát nên phù hợp.

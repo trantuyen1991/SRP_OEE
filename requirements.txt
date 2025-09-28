@@ -1,0 +1,6 @@
+fastapi>=0.112
+uvicorn[standard]>=0.30
+pandas>=2.2
+SQLAlchemy>=2.0
+pymysql>=1.1
+python-dateutil>=2.9

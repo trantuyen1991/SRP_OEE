@@ -1,0 +1,19 @@
+Trả lời 6 câu hỏi chưa rõ.
+1.Plant-level (line_id=0): Bạn muốn gộp toàn bộ line (sum/avg như hiện tại, không group-by line) đúng không? Hay trả kèm line_id cho từng line (để client tự cộng)? (Mình nghiêng về gộp sẵn cho nhẹ UI.)
+Trả lời 1:
+	- oke theo ý bạn nha (Mình nghiêng về gộp sẵn cho nhẹ UI.)
+2.shift_no filter: Khi client gửi shift_no, ta áp constraint theo khung ca từ dim_shift_calendar (kể cả range mode). OK chứ? (Nếu from/to cắt đôi ca, vẫn lọc đúng phần rơi trong ca.)
+Trả lời 2:
+	- oke áp constraint theo khung ca từ dim_shift_calendar (kể cả range mode)
+3.Gran semantics: Bạn có muốn hỗ trợ gran=shift|day|week|month|quarter|year tại /oee/line để trả chuỗi time-buckets theo đúng gran (không chỉ summaries rời rạc), hay để phần gran cao cấp chỉ nằm ở /oee/dashboard? (Theo trả lời #1 mình có thể làm cả hai chế độ trong /oee/line để đúng “1 endpoint – nhiều widget”.)
+Trả lời 3:
+	- Nếu bạn có thể làm cả hai chế độ trong /oee/line để đúng “1 endpoint – nhiều widget” thì chọn cách này luôn cho gọn
+4.TARGET_POINTS vs MAX_ROWS: Đề xuất: client chỉ điều khiển limit (số điểm sau bucket); MAX_ROWS giữ nội bộ (hằng số) làm “cầu chì” SQL. Bạn ok mình không expose MAX_ROWS nữa cho gọn?
+Trả lời 4:
+	- oke bạn, thống nhất client chỉ điều khiển limit
+5.CORS/bảo mật: Giữ * nhưng mình thêm tùy chọn nhẹ: nếu đặt env API_KEY, server yêu cầu header x-api-key. Mặc định tắt (không phá cũ). ✅?
+Trả lời 5:
+	- oke Bạn, hiện tại mình chưa quan tâm vấn đề nay lắm, để không ảnh hưởng đến việc test các tính năng khác, tạm thời giữ nguyên như cũ, sau này các phần khác ổn thì xử lý tiếp phần này.
+6.ISO 8601 kèm offset: Meta trả về generated_at, from_ts, to_ts hiện đang là YYYY-MM-DD HH:MM:SS. Bạn có muốn chuyển sang ISO 8601 có +07:00 không (ví dụ 2025-09-26T21:10:00+07:00) cho nhất quán timezone bạn đã khẳng định?
+Trả lời 6:
+	- oke vậy bạn chuyển sang ISO 8601 có +07:00 luôn giùm mình cho nhất quán timezone

@@ -1,0 +1,91 @@
+Trả lời 12 câu hỏi chưa rõ.
+
+1.Gran mode chuẩn cần hỗ trợ những gì?
+	Hiện gran có default “min”, nhưng trong phần mô tả bạn từng nói gran=min|shift|day|week.... 
+	Có muốn /oee/line thực sự group theo gran (thay vì chỉ “cửa sổ thời gian gần đây”) hay để gran = “min” và các tổng hợp khác lấy ở /oee/dashboard?
+Trả lời 1:
+	- mục đích của mình là tạo 1 endpoint chung để hạn chế query nhiều lần từ database. dữ liệu này sẽ được lưu toàn bộ đạng json để bất kỳ widget nào cũng có thể lấy được data cần thiết.
+	- Khi mình load page dashboard lần đầu thì mặc định sẽ lấy data since_min = 240 "giá trị này mình có thể thay đổi, nếu không có thì mặc định là 240 min".
+	- Sau đó nếu người xem có nhu cầu chọn lọc dữ liệu để xem thì lúc này có 2 option:
+		1. các điều kiện nằm trong các view có sẵn như "shift/day/week/month/quarter/year" thì sẽ lấy data từ các view tương ứng trong database.
+		2. nếu chọn trong khoảng thời gian từ from_ts -> to_ts thì sẽ phải lấy data từ bảng fact_production_min và tổng hợp lại để ra được dữ liệu cần thiết như OEE,Availability/Performance/Quality..
+		Cả hai option trên đều có thêm fillter theo line_id, process_order và packaging_id, nếu không nhập thì mặc định là chọn tất cả.
+	- Bạn xem phần trả lời của mình tự nhận định và đề xuất ý tưởng theo bạn thấy hợp lý và tối ưu nha. nếu cần hỏi thêm thì cứ hỏi, mình sẽ trả lời toàn bộ trước khi bắt đầu sửa code.	
+2.Thời gian & timezone
+	API đang dùng datetime.now() local. Có cần ép timezone (VD: Asia/Ho_Chi_Minh) và trả ISO8601 có offset (+07:00) không? Nếu dữ liệu DB là UTC thì cần convert ở đâu?
+Trả lời 2:
+	- Thời gian mình đang lưu dưới database đang là local timezone đã có offset (+07:00) so với UTC, 
+	nên lúc mình gửi reques xuống cũng dựa theo local timezone, Bạn xem và điều chỉnh trong api cho đồng bộ nha.
+3.Tham số lọc
+	Ngoài line_id, process_order (po) và packaging_id (pkg), bạn có cần thêm lọc theo product_id, shift_no, line_group… không? (để mình chuẩn hóa alias luôn).
+Trả lời 3:
+	- product_id và line_group thì hiện tại mình chưa có dùng, vì ngay trong database hiện chưa có các trường thông tin này. "Chắc để đó sau này mở rộng thì tính sau".
+	- shift_no thì có dùng nha Bạn, bổ xung với câu trả lời số 1 luôn.
+	- line_id sẽ có các giá trị như "103/104/105.." nếu để là 0 thì sau này sẽ tương ứng với Plant "là cả phân xưởng luôn- Phần này sẽ phát triển khi hoàn tất xong từng Line"
+4.Giới hạn dữ liệu
+	TARGET_POINTS=2000, MAX_ROWS=5000. Bạn muốn hard-cap như vậy hay chấp nhận trả về nhiều hơn cho các summary dài (year, quarter)?
+Trả lời 4:
+	- Giống như since_min vậy các giá trị này mình có thể thay đổi được trong option khi reques, còn nếu không có thì sẽ lấy giá trị trên là mặc định.
+	- MAX_ROWS khác gì với TARGET_POINTS nhỉ, tại sao lại dùng 2 tag riêng mình cũng không rõ nữa, liệu có gộp chung thành 1 tag cho gọn được không nhỉ?
+5.CORS & bảo mật
+	Hiện allow_origins=["*"]. Bạn có muốn khóa theo domain nội bộ hoặc thêm API key/Basic auth?
+Trả lời 5:
+	- allow_origins=["*"] Bạn thấy cách nào đơn giản, dễ thực hiện thì làm luôn nha.
+6.Công thức OEE & rate
+	Ở nhiều query, mẫu số Performance dùng (runtime_sec/60) * ideal_rate_per_min từ dim_packaging. Có muốn fallback theo dim_product khi packaging thiếu rate, hay giữ như hiện tại?
+Trả lời 6:
+	- Hiện tại thì mình không có bảng dim_product nên cứ giữ như hiện tại là được.
+7.Shift calendar
+	Bạn xác nhận bảng dim_shift_calendar có handling ca qua đêm (đã dùng s.end_time < s.start_time) là đúng với hiện trạng chấm công/ca của nhà máy chứ?
+Trả lời 7:
+	- Mình không chắc nhưng trước mắt cứ coi nó là như vậy đi.
+8.Số liệu “trống”
+	Khi không có dữ liệu: Gauges nên trả null hay 0.00? (Giờ mình trả null thông qua _df_to_records).
+Trả lời 8:
+	- trả null thông qua _df_to_records cũng được nếu cần sau này mình sẽ sửa sau.
+9.Default cửa sổ gran mode
+	Hiện since_min mặc định đang dùng… DEFAULT_TTL_SEC (30s). Có lẽ bạn muốn mặc định lớn hơn (VD: 240 phút) giống dashboard?
+Trả lời 9:
+	- Mình đã trả lời ở trên rồi since_min có thể thay đổi được khi reques nếu không có thì default = 240min.
+10.Ổn định SQL
+	Một số summary đang “fix” line_id=105 trong select list (alias hiển thị). Có muốn giữ nguyên hay lấy từ param?
+Trả lời 10:
+	- lấy line_id từ param đi bạn để sau này mở rộng sang line khác được.
+11.Chuẩn hóa khóa JSON
+	Bạn muốn mọi series trả về dưới key linechart thống nhất (đã OK), còn linchart/keys cũ thì bỏ hẳn? (để tránh breaking change với widget cũ).
+Trả lời 11:
+	- oke bant thống nhất mọi series trả về dưới key linechart
+12.Kế hoạch module hóa
+	Bạn muốn mình tách ngay thành queries.py, utils.py, api.py và thêm Postman collection + a few pytest smoke tests không? (đã nằm trong hướng tiếp theo).
+Trả lời 12:
+	- Làm luôn Bạn, để dễ kiểm xoát và debug.
+	- Tách nhỏ code & logging rõ ràng (docstring, comments, log cho từng bước). Phần này quan trọng và mình muốn áp dụng cho toàn bộ code từ nay về sau và không cần nhắc lại nha.
+	
+13.Nhất quán from_ts/to_ts format: trong _build_sql_range bạn đang format khác nhau ở hai phiên bản comment/active (":00" vs ":59"). 
+	Mình đề xuất dùng chuẩn “đầu phút” và “< to_ts + 1 phút” hoặc dùng BETWEEN với :to_ts là “HH:MM:59”. Bạn muốn mình chốt quy ước nào?
+Trả lời 13:
+	- dùng BETWEEN với :to_ts là “HH:MM:59”
+14.line_id hardcode trong summaries: thay 105 AS line_id bằng :line_id để tránh hiểu nhầm khi hiển thị.
+Trả lời 13:
+	- oke làm theo đề xuất của bạn đi
+	
+Cần bạn xác nhận thêm 6 điểm (ngắn gọn)
+
+1.Plant-level (line_id=0): Bạn muốn gộp toàn bộ line (sum/avg như hiện tại, không group-by line) đúng không? Hay trả kèm line_id cho từng line (để client tự cộng)? (Mình nghiêng về gộp sẵn cho nhẹ UI.)
+Trả lời 1:
+	- oke theo ý bạn nha (Mình nghiêng về gộp sẵn cho nhẹ UI.)
+2.shift_no filter: Khi client gửi shift_no, ta áp constraint theo khung ca từ dim_shift_calendar (kể cả range mode). OK chứ? (Nếu from/to cắt đôi ca, vẫn lọc đúng phần rơi trong ca.)
+Trả lời 2:
+	- oke áp constraint theo khung ca từ dim_shift_calendar (kể cả range mode)
+3.Gran semantics: Bạn có muốn hỗ trợ gran=shift|day|week|month|quarter|year tại /oee/line để trả chuỗi time-buckets theo đúng gran (không chỉ summaries rời rạc), hay để phần gran cao cấp chỉ nằm ở /oee/dashboard? (Theo trả lời #1 mình có thể làm cả hai chế độ trong /oee/line để đúng “1 endpoint – nhiều widget”.)
+Trả lời 3:
+	- Nếu bạn có thể làm cả hai chế độ trong /oee/line để đúng “1 endpoint – nhiều widget” thì chọn cách này luôn cho gọn
+4.TARGET_POINTS vs MAX_ROWS: Đề xuất: client chỉ điều khiển limit (số điểm sau bucket); MAX_ROWS giữ nội bộ (hằng số) làm “cầu chì” SQL. Bạn ok mình không expose MAX_ROWS nữa cho gọn?
+Trả lời 4:
+	- oke bạn, thống nhất client chỉ điều khiển limit
+5.CORS/bảo mật: Giữ * nhưng mình thêm tùy chọn nhẹ: nếu đặt env API_KEY, server yêu cầu header x-api-key. Mặc định tắt (không phá cũ). ✅?
+Trả lời 5:
+	- oke Bạn, hiện tại mình chưa quan tâm vấn đề nay lắm, để không ảnh hưởng đến việc test các tính năng khác, tạm thời giữ nguyên như cũ, sau này các phần khác ổn thì xử lý tiếp phần này.
+6.ISO 8601 kèm offset: Meta trả về generated_at, from_ts, to_ts hiện đang là YYYY-MM-DD HH:MM:SS. Bạn có muốn chuyển sang ISO 8601 có +07:00 không (ví dụ 2025-09-26T21:10:00+07:00) cho nhất quán timezone bạn đã khẳng định?
+Trả lời 6:
+	- 
