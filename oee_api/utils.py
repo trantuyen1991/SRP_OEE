@@ -4,7 +4,7 @@
 """Utilities: time helpers, JSON sanitation, DF conversions, bucketing.
 """
 from __future__ import annotations
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from decimal import Decimal
@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 from oee_api.config import SETTINGS
-
+import logging
+import os, time, threading
 # ---------------- Time helpers ----------------
 
 def tz() -> ZoneInfo:
@@ -194,75 +195,6 @@ def compute_oee(inp: OeeInputs) -> dict:
     }
 
 # ---- OEE payload normalizer -------------------------------------------------
-# def normalize_oee_payload(payload: dict) -> dict:
-#     """Enforce OEE contract on output payload (gauges + linechart).
-#     Rules:
-#       - Any % None/NaN -> 0.0
-#       - Missing ideal_rate_per_min (None/NaN/<=0) -> performance = 0.0
-#       - No-data bucket (good+reject==0 and runtime+downtime==0) -> all % = 0.0
-#       - Recompute OEE = A*P*Q/10000
-#       - Cast counters to int
-#     """
-
-#     def _is_nan(x) -> bool:
-#         return isinstance(x, float) and math.isnan(x)
-
-#     def _nz_int(x) -> int:
-#         if x is None or _is_nan(x):
-#             return 0
-#         try:
-#             return int(x)
-#         except Exception:
-#             return 0
-
-#     def _ideal_or_none(x):
-#         if x is None or _is_nan(x):
-#             return None
-#         try:
-#             v = float(x)
-#         except Exception:
-#             return None
-#         return v if v > 0 else None
-
-#     def _fix_point(pt: dict):
-#         # counters
-#         g  = _nz_int(pt.get("good"))
-#         rj = _nz_int(pt.get("reject"))
-#         rt = _nz_int(pt.get("runtime_sec"))
-#         dt = _nz_int(pt.get("downtime_sec"))
-#         ideal = _ideal_or_none(pt.get("ideal_rate_per_min"))
-
-#         pt["good"] = g; pt["reject"] = rj
-#         pt["runtime_sec"] = rt; pt["downtime_sec"] = dt
-
-#         # fill % None/NaN -> 0.0
-#         for k in ("availability", "performance", "quality", "oee"):
-#             v = pt.get(k)
-#             pt[k] = 0.0 if (v is None or _is_nan(v)) else float(v)
-
-#         # rules
-#         if ideal is None:
-#             pt["performance"] = 0.0
-#         if (g + rj == 0) and (rt + dt == 0):
-#             for k in ("availability", "performance", "quality", "oee"):
-#                 pt[k] = 0.0
-
-#         # recompute OEE (A*P*Q/10000)
-#         pt["oee"] = pt["availability"] * pt["performance"] * pt["quality"] / 10000.0
-
-#     # --- gauges
-#     g = payload.get("gauges")
-#     if isinstance(g, dict):
-#         _fix_point(g)
-
-#     # --- linechart
-#     lc = payload.get("linechart")
-#     if isinstance(lc, list):
-#         for pt in lc:
-#             if isinstance(pt, dict):
-#                 _fix_point(pt)
-
-#     return payload
 def normalize_oee_payload(payload: dict) -> dict:
     """Enforce OEE contract on output payload (gauges + linechart).
         Rules:
@@ -300,7 +232,6 @@ def normalize_oee_payload(payload: dict) -> dict:
         rj = _nz_int(pt.get("reject"))
         rt = _nz_int(pt.get("runtime_sec"))
         dt = _nz_int(pt.get("downtime_sec"))
-        ideal_ok = _ideal_ok(pt.get("ideal_rate_per_min"))
 
         pt["good"] = g; pt["reject"] = rj
         pt["runtime_sec"] = rt; pt["downtime_sec"] = dt
@@ -315,10 +246,6 @@ def normalize_oee_payload(payload: dict) -> dict:
             if _is_nan(v):
                 v = 0.0
             pt[k] = v
-
-        # Thiếu ideal -> performance = 0.0 (ép sau cùng để chắc chắn)
-        if not ideal_ok:
-            pt["performance"] = 0.0
 
         # Bucket không dữ liệu -> 4% = 0.0
         if (g + rj == 0) and (rt + dt == 0):
@@ -339,3 +266,62 @@ def normalize_oee_payload(payload: dict) -> dict:
                 _fix_point(pt)
 
     return payload
+# ==== Auto bucketing helper ==================================================
+logger = logging.getLogger("oee.utils")
+
+def choose_bucket_seconds_auto(range_seconds: int, limit: int) -> int:
+    """
+    Chọn bucket_sec tự động cho linechart dựa trên độ dài khoảng thời gian và limit.
+    - Ít nhất 60 giây (1 phút).
+    - Làm tròn lên bội số của 60 cho đẹp (5 phút, 10 phút, ...).
+    """
+    try:
+        limit = int(limit or 2000)
+        range_seconds = int(max(0, range_seconds))
+    except Exception:
+        limit = 2000
+
+    if limit <= 0 or range_seconds <= 0:
+        logger.debug("auto-bucket: trivial, range=%s, limit=%s -> 60", range_seconds, limit)
+        return 60
+
+    raw = math.ceil(range_seconds / limit)  # số giây/bucket thô
+    # làm tròn lên bội số 60
+    bucket_sec = max(60, int(math.ceil(raw / 60.0) * 60))
+    logger.info("auto-bucket: range_sec=%s, limit=%s -> bucket_sec=%s", range_seconds, limit, bucket_sec)
+    return bucket_sec
+
+# ==== Simple in-process TTL Cache ============================================
+class TTLCache:
+    """Rất gọn: lưu (expire_ts, value) theo key (hashable). Thread-safe."""
+    def __init__(self, ttl_sec: int = 30, maxsize: int = 512):
+        self.ttl_sec = int(ttl_sec)
+        self.maxsize = int(maxsize)
+        self._store: Dict[Any, Tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: Any) -> Optional[Any]:
+        now = time.time()
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            exp, val = item
+            if exp < now:
+                # hết hạn -> xóa
+                self._store.pop(key, None)
+                return None
+            return val
+
+    def set(self, key: Any, value: Any) -> None:
+        exp = time.time() + self.ttl_sec
+        with self._lock:
+            if len(self._store) >= self.maxsize:
+                # dọn thô: xóa các mục đã hết hạn; nếu vẫn đầy -> pop bất kỳ
+                now = time.time()
+                for k, (e, _) in list(self._store.items()):
+                    if e < now:
+                        self._store.pop(k, None)
+                if len(self._store) >= self.maxsize:
+                    self._store.pop(next(iter(self._store)), None)
+            self._store[key] = (exp, value)

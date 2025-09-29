@@ -191,3 +191,27 @@ LEFT JOIN dim_packaging p ON p.packaging_id = f.packaging_id
 {shift_join}
 {where}
 """.strip()
+
+# ==== Auto-bucket series (dùng cho mọi scope from_ts/to_ts) ==================
+# Thứ tự placeholder (?):
+#   1: bucket_sec
+#   2: bucket_sec (lặp lại trong FROM_UNIXTIME)
+#   3..N: where params (tùy filter)
+#   Cuối: LIMIT
+SERIES_AUTO = r"""
+SELECT
+  FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(f.ts_min)/?)*?)      AS ts_bucket,
+  {line_id_expr}                                          AS line_id,
+  SUM(f.good)                                             AS good,
+  SUM(f.ng)                                               AS reject,
+  SUM(f.runtime_sec)                                      AS runtime_sec,
+  SUM(GREATEST(f.planned_sec - f.runtime_sec, 0))         AS downtime_sec,
+  COALESCE(SUM(dp.ideal_rate_per_min), 0)                 AS ideal_rate_per_min
+FROM fact_production_min f
+LEFT JOIN dim_packaging dp ON dp.packaging_id = f.packaging_id
+{shift_join}
+{where}
+GROUP BY ts_bucket
+ORDER BY ts_bucket
+LIMIT ?
+""".strip()

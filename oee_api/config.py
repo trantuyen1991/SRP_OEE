@@ -17,6 +17,8 @@ class _Settings:
     MAX_ROWS_FUSE: int = 500000
     TIMEZONE: str = "Asia/Ho_Chi_Minh"
 
+    
+
     def __post_init__(self):
         if self.CORS_ALLOW_ORIGINS is None:
             allow_all = os.getenv("CORS_ALLOW_ALL", "1") == "1"

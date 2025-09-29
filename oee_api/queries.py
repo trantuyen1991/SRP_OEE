@@ -10,7 +10,7 @@ Query orchestration:
 - Shapes payload according to `include`
 """
 from typing import Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import HTTPException
 import logging
 import pandas as pd
@@ -26,9 +26,22 @@ from oee_api.utils import (
     to_local_str,
     OeeInputs,
     compute_oee,
+    choose_bucket_seconds_auto,
+    TTLCache,
 )
 from oee_api import sql_texts as SQL
 import math
+import os
+
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "30"))   # TTL mặc định 30s
+CACHE_MAX_KEYS = int(os.getenv("CACHE_MAX_KEYS", "1024"))
+CACHE_WINDOW_SEC = int(os.getenv("CACHE_WINDOW_SEC", "10"))   # 10 giây là hợp lý cho dashboard
+
+CACHE_HIT   = 0
+CACHE_MISS  = 0
+
+CACHE = TTLCache(ttl_sec=CACHE_TTL_SEC, maxsize=CACHE_MAX_KEYS)
+
 logger = logging.getLogger("oee.queries")
 
 def _is_nan(x) -> bool:
@@ -141,6 +154,12 @@ def _postprocess_series(df: pd.DataFrame) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+def _floor_dt(dt, sec: int):
+    if sec <= 0:
+        return dt.replace(microsecond=0)
+    ts = int(dt.timestamp())
+    floored = ts - (ts % sec)
+    return dt.__class__.fromtimestamp(floored, tz=dt.tzinfo)
 
 async def build_payload(
     line_id: int,
@@ -158,6 +177,43 @@ async def build_payload(
     Returns dict with keys: meta, gauges?, linechart?, summaries?
     """
     span_seconds = int((dt_to - dt_from).total_seconds())
+
+    # --- pick bucket for linechart (auto density) ---
+    auto_bucket_sec = choose_bucket_seconds_auto(span_seconds, limit)
+    logger.info("series:auto gran, window=%ss, limit=%s -> bucket_sec=%s", span_seconds, limit, auto_bucket_sec)
+
+    # --- Compose cache key -------------------------------------------------------
+    # include có thể là "gauges,linechart" -> chuẩn hóa thành tuple có thứ tự ổn định
+    _inc = tuple(sorted(p.strip() for p in include if p.strip()))
+
+    # --- floor thời điểm kết thúc để tăng tỷ lệ HIT ---
+    dt_to_key = _floor_dt(dt_to, CACHE_WINDOW_SEC)
+    # (tuỳ chọn) nếu muốn chắc ăn hơn, có thể floor cả dt_from khi scope=minute/between
+    dt_from_key = _floor_dt(dt_from, CACHE_WINDOW_SEC)  
+    # dt_from_key = dt_from
+    cache_key = (
+        "oee.v2",                # thay đổi khi bạn đổi format payload -> tự vô hiệu cache cũ
+        int(line_id or 0),
+        gran or "",
+        dt_from_key.isoformat(),
+        dt_to_key.isoformat(),
+        int(limit or 0),
+        po or "", int(pkg or 0), int(shift_no or 0),
+        _inc,
+    )
+    cached = CACHE.get(cache_key)
+    # logger.info("cached=%s  cache_key=%s", cached, cache_key)
+    if cached is not None:
+        global CACHE_HIT
+        CACHE_HIT += 1
+        # logger.info("CACHE HIT=%s  key=%s from=%s to=%s include=%s",
+                    # CACHE_HIT, cache_key[:3], to_local_str(dt_from), to_local_str(dt_to), _inc)
+        return cached                      
+
+    else:
+        global CACHE_MISS
+        CACHE_MISS += 1
+        # logger.info("CACHE MISS=%s  key=%s", CACHE_MISS, cache_key[:3])
 
     meta = {
         "generated_at": to_local_str(now_local()),
@@ -257,6 +313,7 @@ async def build_payload(
 
     # --------- Gauges (aggregate over the window) ---------
     if "gauges" in include:
+        logger.debug("gauges window: %s .. %s", dt_from, dt_to)
         gw, gparams, gsj = _assemble_where(dt_from, dt_to, line_id, po, pkg, shift_no, shift_join=False)
         line_expr = "?" if line_id == 0 else "f.line_id"
         gauges_sql = SQL.GAUGES.format(line_id_expr=line_expr, shift_join=gsj, where=gw)
@@ -297,7 +354,7 @@ async def build_payload(
         gauges["oee"] = (
             gauges["availability"] * gauges["performance"] * gauges["quality"] / 10000.0
         )
-
+        
         gauges.update({
             "line_id": line_id,
             "good": good,
@@ -307,40 +364,34 @@ async def build_payload(
         })
         out["gauges"] = gauges
 
-    # --------- linechart ---------
+    # ---- LINECHART (auto-bucket by time window) ----
     if "linechart" in include:
-        recs = df_to_records(series_df)
+        # compose WHERE and params như bạn đang làm (dựa vào dt_from/dt_to/line_id/po/pkg/shift_no)
+        where_sql, where_params, shift_join = _assemble_where(
+            dt_from=dt_from, dt_to=dt_to,
+            line_id=line_id, po=po, pkg=pkg, shift_no=shift_no, shift_join=False
+        )
 
-        # ---- Last guard: đảm bảo hợp đồng ở cấp JSON records ----
-        for pt in recs:
-            # chuẩn hoá số đếm
-            g  = _nz_int(pt.get("good"))
-            rj = _nz_int(pt.get("reject"))
-            rt = _nz_int(pt.get("runtime_sec"))
-            dt = _nz_int(pt.get("downtime_sec"))
-            ideal = _ideal_or_none(pt.get("ideal_rate_per_min"))
+        # chọn biểu thức line_id cho plant-level vs line-level
+        line_id_expr = "0" if line_id == 0 else str(int(line_id))
 
-            # fill None/NaN -> 0.0 cho 4 chỉ số %
-            for k in ("availability", "performance", "quality", "oee"):
-                v = pt.get(k)
-                if v is None or _is_nan(v):
-                    pt[k] = 0.0
-                else:
-                    pt[k] = float(v)
+        # lắp template
+        sql = SQL.SERIES_AUTO.format(
+            line_id_expr=line_id_expr,
+            shift_join=shift_join,
+            where=where_sql,
+        )
 
-            # thiếu ideal -> performance = 0.0
-            if ideal is None:
-                pt["performance"] = 0.0
+        params = [auto_bucket_sec, auto_bucket_sec] + where_params + [int(limit)]
+        logger.debug("run SERIES_AUTO: bucket_sec=%s, limit=%s, params=%s", auto_bucket_sec, limit, where_params)
 
-            # bucket không có dữ liệu -> 4% = 0.0
-            if (g + rj == 0) and (rt + dt == 0):
-                for k in ("availability", "performance", "quality", "oee"):
-                    pt[k] = 0.0
+        series_df = query_df(sql, params)
+        logger.info("linechart points=%s (before normalize)", len(series_df))
 
-            # tính lại OEE cho nhất quán
-            pt["oee"] = pt["availability"] * pt["performance"] * pt["quality"] / 10000.0
-
-        out["linechart"] = recs
+        # tính lại các chỉ số OEE cho từng bucket
+        series_df = _postprocess_series(series_df)
+        
+        out["linechart"]= df_to_records(series_df)
 
     # --------- summaries (basic counts by gran for convenience) ---------
     if "summaries" in include:
@@ -353,5 +404,7 @@ async def build_payload(
                 "total_good": int(series_df["good"].fillna(0).sum()),
                 "total_reject": int(series_df["reject"].fillna(0).sum()),
             }
-
+    # --- Set cache ---------------------------------------------------------------
+    CACHE.set(cache_key, out)
+    logger.info("CACHE SET key=%s size=%s", cache_key[:3], len(out.get("linechart", [])) if isinstance(out.get("linechart"), list) else "-")
     return out

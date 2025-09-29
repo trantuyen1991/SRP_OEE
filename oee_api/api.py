@@ -35,7 +35,19 @@ from oee_api.queries import (
     build_payload,
 )
 from oee_api.schemas import Payload, Granularity
+from enum import Enum
+from datetime import timedelta
+import time
+from typing import Dict, Any, Optional, Tuple, List
 
+class Scope(str, Enum):
+    minute = "minute"
+    day = "day"
+    week = "week"
+    month = "month"
+    quarter = "quarter"
+    year = "year"
+    between = "between"
 # --------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------
@@ -84,44 +96,32 @@ def health():
 
 async def get_oee_line(
     line_id: int = Path(..., ge=0, description="Line ID. Use 0 for Plant-level aggregation."),
-    # time selectors
-    from_ts: Optional[str] = Query(
-        None,
-        description="Local time 'YYYY-MM-DD HH:MM:SS'. If set, since_min is ignored.",
-        examples={
-            "startOfWindow": {"summary": "Start of range", "value": "2025-09-27 07:00:00"},
-            "monthStart":    {"summary": "Month start",   "value": "2025-09-01 00:00:00"},
-        },
-    ),
-    to_ts: Optional[str] = Query(
-        None,
-        description="Local time 'YYYY-MM-DD HH:MM:SS'.",
-        examples={
-            "endOfWindow": {"summary": "End of range", "value": "2025-09-27 11:00:00"},
-            "monthEnd":    {"summary": "Month end",    "value": "2025-09-30 23:59:59"},
-        },
-    ),
+    # --- scope-first parameters ---
+    scope: Scope = Query(Scope.day, description="Time scope for view: minute/day/week/month/quarter/year/between."),
     since_min: Optional[int] = Query(
-        SETTINGS.DEFAULT_SINCE_MIN, ge=1,
-        description="Lookback minutes when from/to are omitted.",
+        SETTINGS.DEFAULT_SINCE_MIN, 
+        ge=1, 
+        description="Only when scope=minute. Lookback minutes.",
         examples={
             "last15":  {"summary": "Last 15 minutes", "value": 15},
             "last240": {"summary": "Last 4 hours",    "value": 240},
             "last720": {"summary": "Last 12 hours",   "value": 720},
         },
     ),
-    # granularity
-    gran: Granularity = Query(
-        "min", description="Series granularity.",
+    from_ts: Optional[str] = Query(
+        None, 
+        description="Only when scope=between. 'YYYY-MM-DD HH:MM:SS' (local)",
         examples={
-            "minute":  {"summary": "Per minute",  "value": "min"},
-            "hour":    {"summary": "Per hour",    "value": "hour"},
-            "day":     {"summary": "Per day",     "value": "day"},
-            "week":    {"summary": "Per ISO week","value": "week"},
-            "month":   {"summary": "Per month",   "value": "month"},
-            "quarter": {"summary": "Per quarter", "value": "quarter"},
-            "year":    {"summary": "Per year",    "value": "year"},
-            "shift":   {"summary": "Per shift",   "value": "shift"},
+            "startOfWindow": {"summary": "Start of range", "value": "2025-09-27 07:00:00"},
+            "monthStart":    {"summary": "Month start",   "value": "2025-09-01 00:00:00"},
+        },
+    ),
+    to_ts: Optional[str] = Query(
+        None, 
+        description="Only when scope=between. 'YYYY-MM-DD HH:MM:SS' (local)",
+        examples={
+            "endOfWindow": {"summary": "End of range", "value": "2025-09-27 11:00:00"},
+            "monthEnd":    {"summary": "Month end",    "value": "2025-09-30 23:59:59"},
         },
     ),
     # filters
@@ -142,13 +142,8 @@ async def get_oee_line(
     # shaping
     limit: int = Query(
         SETTINGS.DEFAULT_LIMIT, ge=10, le=SETTINGS.HARD_MAX_LIMIT,
-        description="Max buckets returned after grouping.",
+        description="Max points AFTER auto-bucketing.",
         examples={"tight": {"summary": "Cap at 120 points", "value": 120}},
-    ),
-    bucket_sec: Optional[int] = Query(
-        None, ge=60,
-        description="Bucket seconds for 'min'/'hour' gran. E.g., 300 = 5 minutes.",
-        examples={"fiveMin": {"summary": "5-minute buckets", "value": 300}},
     ),
     include: str = Query(
         "gauges,linechart",
@@ -164,16 +159,55 @@ async def get_oee_line(
 ):
     """
     Main OEE endpoint. Examples:
-    - /oee/line/105?since_min=240&gran=min&include=gauges,linechart
-    - /oee/line/0?from_ts=2025-09-20T00:00:00+07:00&to_ts=2025-09-26T23:59:59+07:00&gran=day&include=linechart,summaries
+    - /oee/line/105?scope=minute&since_min=240&include=gauges,linechart
+    - /oee/line/0?gran=between&from_ts=2025-09-20T00:00:00+07:00&to_ts=2025-09-26T23:59:59+07:00&include=linechart,summaries
     """
     await _check_api_key(x_api_key)
 
-    logger.info("/oee/line start | line_id=%s gran=%s include=%s", line_id, gran, include)
+    # --- resolve time window from scope ---
+    now = now_local()
+    if scope == Scope.minute:
+        m = int(since_min or SETTINGS.DEFAULT_SINCE_MIN)  # ví dụ mặc định 240 nếu bạn đang dùng
+        dt_from, dt_to = now - timedelta(minutes=m), now
+    elif scope == Scope.between:
+        if not from_ts or not to_ts:
+            raise HTTPException(status_code=400, detail="from_ts & to_ts are required when scope=between")
+        dt_from, dt_to = parse_from_to(from_ts, to_ts)  # bạn đã có helper này
+    elif scope == Scope.day:
+        dt_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_to = now
+    elif scope == Scope.week:
+        # tuần bắt đầu Thứ 2 00:00
+        weekday = (now.weekday() + 7) % 7  # 0=Mon
+        monday = (now - timedelta(days=weekday)).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = monday, now
+    elif scope == Scope.month:
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    elif scope == Scope.quarter:
+        q = (now.month - 1) // 3  # 0..3
+        first_month = 1 + q*3
+        first = now.replace(month=first_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    elif scope == Scope.year:
+        first = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    else:
+        # fallback an toàn
+        m = int(since_min or SETTINGS.DEFAULT_SINCE_MIN)
+        dt_from, dt_to = now - timedelta(minutes=m), now
 
-    # 1) Decide time window (from_ts/to_ts)
-    dt_from, dt_to = parse_from_to(from_ts, to_ts, since_min)
-    logger.info("window: %s → %s", to_iso8601(dt_from), to_iso8601(dt_to))
+    logger.info("/oee/line start | line_id=%s scope=%s -> window %s .. %s include=%s", line_id, scope, to_local_str(dt_from), to_local_str(dt_to), include)
+
+    # map scope -> gran 
+    if scope == Scope.minute:
+        gran_for_queries = "min"
+    elif scope == Scope.between:
+        # linechart dùng auto-bucket; gran chỉ để log/summary => chọn "min" làm giá trị an toàn
+        gran_for_queries = "min"
+    else:
+        gran_for_queries = scope.value  # day/week/month/quarter/year
+
 
     # 2) Decide which parts to include
     include_parts: List[str] = [p.strip() for p in include.split(",") if p.strip()]
@@ -183,9 +217,9 @@ async def get_oee_line(
         line_id=line_id,
         dt_from=dt_from,
         dt_to=dt_to,
-        gran=gran,
+        gran=gran_for_queries,
         limit=limit,
-        bucket_sec=bucket_sec,
+        bucket_sec=None,
         po=po,
         pkg=pkg,
         shift_no=shift_no,
@@ -196,7 +230,6 @@ async def get_oee_line(
     payload = normalize_oee_payload(payload)
     # 5) Final sanitation + response
     payload = sanitize_json_deep(payload)
-    
     return JSONResponse(payload)
 
 if __name__ == "__main__":
