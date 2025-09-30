@@ -89,7 +89,6 @@ def df_to_records(df: pd.DataFrame) -> list[dict]:
     df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
-            # df[col] = pd.to_datetime(df[col], errors="coerce").dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
             df[col] = pd.to_datetime(df[col], errors="coerce")
     records = df.to_dict(orient="records")
     return records
@@ -156,12 +155,14 @@ def choose_bucket_seconds(span_seconds: int, limit: int, gran: str, override: Op
 # ---------------- OEE calculations ----------------
 @dataclass
 class OeeInputs:
+    line_id:int
     good: float
     reject: float
     runtime_sec: float
     downtime_sec: float
     ideal_rate_per_min: Optional[float]  # may be None
-
+    # NEW: tổng công suất lý thuyết (đã nhân theo runtime từng line)
+    ideal_capacity_cnt: Optional[float] = None
 
 def compute_oee(inp: OeeInputs) -> dict:
     """Compute A/P/Q/OEE using a pragmatic formula consistent with your notes.
@@ -176,12 +177,21 @@ def compute_oee(inp: OeeInputs) -> dict:
 
     availability = (run / plan) if plan and plan > 0 else None
     performance = None
-    if inp.ideal_rate_per_min and inp.ideal_rate_per_min > 0 and run and run > 0:
-        performance = (total / ((run / 60.0) * inp.ideal_rate_per_min))
+    if inp.line_id == 0: # plant-level:
+        if inp.ideal_capacity_cnt and inp.ideal_capacity_cnt > 0 and run and run > 0:
+            performance = (total / inp.ideal_capacity_cnt)
+    else:   #line-level:
+        if inp.ideal_rate_per_min and inp.ideal_rate_per_min > 0 and run and run > 0:
+            performance = (total / ((run / 60.0) * inp.ideal_rate_per_min))
     quality = (inp.good / total) if total > 0 else None
 
-    def pct(x):
-        return None if x is None else round(float(x) * 100.0, 2)
+    def pct(x) -> Optional[float]:
+        if x is None:
+            return 0.0
+        try:
+            return round(float(x) * 100.0, 2)
+        except Exception:
+            return 0.0
 
     oee = None
     if availability is not None and performance is not None and quality is not None:

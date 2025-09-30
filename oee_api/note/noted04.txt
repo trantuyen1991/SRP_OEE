@@ -1,0 +1,108 @@
+📌 Tổng hợp tiến trình API OEE (topic hiện tại)
+1. Cấu trúc & Kết nối
+
+	API server chạy FastAPI, tách thành nhiều file:
+
+	api.py: router & Swagger/OpenAPI.
+
+	queries.py: build payload, chạy SQL.
+
+	sql_texts.py: chứa template SQL.
+
+	utils.py: helper, tính toán OEE, bucket, cache…
+
+	DB truy vấn bằng SQLAlchemy (ODBC chỉ dùng cho AVEVA).
+
+2. Scope & Time Window
+
+	Chuyển từ gran sang scope (minute/day/week/month/quarter/year/between).
+
+	Quy ước:
+
+	minute: cần since_min.
+
+	between: cần from_ts & to_ts.
+
+	Các scope còn lại API tự tính from/to (00:00 → now, Mon 00:00 → now,…).
+
+	Linechart auto-bucketing: chọn bucket_sec = ceil(range_sec/limit) làm tròn lên phút.
+
+	Gauges tính trên toàn bộ phạm vi.
+
+3. Cache
+
+	Tích hợp in-process TTL cache:
+
+	Key = (line_id, scope/gran, from_ts, to_ts floored, filters, include…).
+
+	TTL mặc định 15–30s, cửa sổ key (floor dt_to) mặc định 10s.
+
+	Có log CACHE HIT/MISS/SET để kiểm chứng.
+
+	Đảm bảo tránh None/NaN khi normalize → luôn trả về 0.0 hoặc số %.
+
+4. Tính toán OEE
+
+	Thống nhất công thức trong 1 hàm duy nhất: compute_oee() (utils.py).
+
+	Input = OeeInputs gồm: good, reject, runtime_sec, downtime_sec, ideal_rate_per_min, ideal_capacity_cnt.
+
+	Logic:
+
+	Availability = runtime / (runtime+downtime).
+
+	Quality = good / (good+reject).
+
+	Performance:
+
+	Nếu có ideal_capacity_cnt (plant-level) → dùng tổng công suất lý thuyết.
+
+	Ngược lại (line-level) → dùng rate * runtime.
+
+	OEE = A * P * Q.
+
+	Output: % (2 decimal) hoặc 0.0 khi thiếu dữ liệu.
+
+5. SQL chỉnh sửa
+
+	Trong GAUGES & SERIES_* thêm:
+
+	MAX(p.ideal_rate_per_min) AS ideal_rate_per_min,
+	SUM(p.ideal_rate_per_min * f.runtime_sec/60.0) AS ideal_capacity_cnt
+
+
+	Nhờ vậy compute_oee tự xử lý đúng cho cả line-level & plant-level.
+
+6. Khác
+
+	Thống nhất null/undefined → trả về 0.0 để chart không lỗi.
+
+	Swagger/OpenAPI hiển thị rõ scope, filters, include, limit, ví dụ cho Postman/Swagger UI.
+
+	Logging chi tiết từng bước (range_sec, bucket_sec, số điểm linechart, totals gauges…).
+
+✅ Kết quả
+
+	API server hiện đã:
+
+	Hỗ trợ scope-first request.
+
+	Tích hợp cache TTL hoạt động.
+
+	Tính toán OEE chuẩn cho cả line và plant.
+
+	Tránh lỗi null/NaN cho frontend.
+
+	Dễ mở rộng sau này (summary tables, Redis cache, view riêng…).
+	
+	
+7. Các mục tiêu phát triển tiếp theo:
+
+	A. Bổ sung API mới cung cấp dữ liệu cho các biểu đồ khác như race chart-downtime, gantt-machine status, pareto...
+
+	B. Tối ưu hiệu năng (index DB, summary tables).
+
+	C. Xuất báo cáo/tích hợp dashboard (ECharts/ThingsBoard).
+
+	D. Tích hợp bảo mật (API key, JWT).
+	

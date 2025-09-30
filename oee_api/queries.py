@@ -106,7 +106,7 @@ def _assemble_where(
     sj = SQL.SHIFT_CROSS_JOIN if shift_join or (shift_no is not None) else ""
     return where, params, sj
 
-def _postprocess_series(df: pd.DataFrame) -> pd.DataFrame:
+def _postprocess_series(lineID,df: pd.DataFrame) -> pd.DataFrame:
     """Compute per-row OEE metrics từ raw sums.
     Trả về DataFrame đã 'zeroize' các % metrics để vẽ chart không lỗi.
     """
@@ -117,31 +117,14 @@ def _postprocess_series(df: pd.DataFrame) -> pd.DataFrame:
         runtime_sec = _nz_int(r.get("runtime_sec"))
         downtime_sec = _nz_int(r.get("downtime_sec"))
         ideal = _ideal_or_none(r.get("ideal_rate_per_min"))
+        ideal_cnt = _ideal_or_none(r.get("ideal_capacity_cnt"))
 
         metrics = compute_oee(OeeInputs(
+            line_id=lineID,
             good=good, reject=reject,
             runtime_sec=runtime_sec, downtime_sec=downtime_sec,
-            ideal_rate_per_min=ideal,
+            ideal_rate_per_min=ideal,ideal_capacity_cnt=ideal_cnt,
         ))
-
-        # === Cưỡng chế theo hợp đồng ===
-        no_data = (good + reject == 0) and (runtime_sec + downtime_sec == 0)
-
-        for k in ("availability", "performance", "quality", "oee"):
-            v = metrics.get(k)
-            metrics[k] = 0.0 if (v is None or _is_nan(v)) else float(v)
-
-        if ideal is None:
-            metrics["performance"] = 0.0
-
-        if no_data:
-            for k in ("availability", "performance", "quality", "oee"):
-                metrics[k] = 0.0
-
-        # tính lại OEE cho nhất quán
-        metrics["oee"] = (
-            metrics["availability"] * metrics["performance"] * metrics["quality"] / 10000.0
-        )
 
         row = dict(r)
         # ép số đếm về int để JSON gọn và ổn định
@@ -283,7 +266,7 @@ async def build_payload(
     # --------- execute series SQL ---------
     logger.info("series SQL gran=%s", gran)
     series_df = query_df(series_sql, sparams)
-    series_df = _postprocess_series(series_df)
+    series_df = _postprocess_series(lineID=line_id, df= series_df)
     # ---- Belt & suspenders: enforce hợp đồng ở cấp DataFrame ----
     if not series_df.empty:
         # 1) Chuẩn hóa kiểu & fillna cho 4 % metrics
@@ -331,29 +314,14 @@ async def build_payload(
         runtime_sec = _nz_int(gauges_row.get("runtime_sec"))
         downtime_sec = _nz_int(gauges_row.get("downtime_sec"))
         ideal = _ideal_or_none(gauges_row.get("ideal_rate_per_min"))
+        ideal_cnt = _ideal_or_none(gauges_row.get("ideal_capacity_cnt"))
 
         gauges = compute_oee(OeeInputs(
+            line_id=line_id,
             good=good, reject=reject,
             runtime_sec=runtime_sec, downtime_sec=downtime_sec,
-            ideal_rate_per_min=ideal,
+            ideal_rate_per_min=ideal,ideal_capacity_cnt=ideal_cnt,
         ))
-
-        no_data = (good + reject == 0) and (runtime_sec + downtime_sec == 0)
-
-        for k in ("availability", "performance", "quality", "oee"):
-            v = gauges.get(k)
-            gauges[k] = 0.0 if (v is None or _is_nan(v)) else float(v)
-
-        if ideal is None:
-            gauges["performance"] = 0.0
-
-        if no_data:
-            for k in ("availability", "performance", "quality", "oee"):
-                gauges[k] = 0.0
-
-        gauges["oee"] = (
-            gauges["availability"] * gauges["performance"] * gauges["quality"] / 10000.0
-        )
         
         gauges.update({
             "line_id": line_id,
@@ -385,13 +353,13 @@ async def build_payload(
         params = [auto_bucket_sec, auto_bucket_sec] + where_params + [int(limit)]
         logger.debug("run SERIES_AUTO: bucket_sec=%s, limit=%s, params=%s", auto_bucket_sec, limit, where_params)
 
-        series_df = query_df(sql, params)
-        logger.info("linechart points=%s (before normalize)", len(series_df))
+        linechart_df = query_df(sql, params)
+        logger.info("linechart points=%s (before normalize)", len(linechart_df))
 
         # tính lại các chỉ số OEE cho từng bucket
-        series_df = _postprocess_series(series_df)
+        linechart_df = _postprocess_series(lineID=line_id, df=linechart_df)
         
-        out["linechart"]= df_to_records(series_df)
+        out["linechart"]= df_to_records(linechart_df)
 
     # --------- summaries (basic counts by gran for convenience) ---------
     if "summaries" in include:

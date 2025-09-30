@@ -172,7 +172,7 @@ async def get_oee_line(
     elif scope == Scope.between:
         if not from_ts or not to_ts:
             raise HTTPException(status_code=400, detail="from_ts & to_ts are required when scope=between")
-        dt_from, dt_to = parse_from_to(from_ts, to_ts)  # bạn đã có helper này
+        dt_from, dt_to = parse_from_to(from_ts, to_ts, since_min=240)  # bạn đã có helper này
     elif scope == Scope.day:
         dt_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
         dt_to = now
@@ -227,11 +227,11 @@ async def get_oee_line(
     )
 
     # 4) chốt hạ output theo hợp đồng
-    payload = normalize_oee_payload(payload)
+    # payload = normalize_oee_payload(payload)
     # 5) Final sanitation + response
     payload = sanitize_json_deep(payload)
     return JSONResponse(payload)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("oee_api.api:app", host="0.0.0.0", port=8080, reload=False, workers=1)
+    uvicorn.run("oee_api.api:app", host="0.0.0.0", port=8088, reload=False, workers=1)

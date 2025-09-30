@@ -181,11 +181,12 @@ LIMIT ?
 GAUGES = """
 SELECT
   {line_id_expr} AS line_id,
-  SUM(f.good)                                  AS good,
-  SUM(f.ng)                                     AS reject,
-  SUM(f.runtime_sec)                            AS runtime_sec,
-  SUM(GREATEST(f.planned_sec - f.runtime_sec,0)) AS downtime_sec,
-  MAX(p.ideal_rate_per_min)                     AS ideal_rate_per_min
+  SUM(f.good)                                     AS good,
+  SUM(f.ng)                                       AS reject,
+  SUM(f.runtime_sec)                              AS runtime_sec,
+  SUM(GREATEST(f.planned_sec - f.runtime_sec,0))  AS downtime_sec,
+  MAX(p.ideal_rate_per_min)                       AS ideal_rate_per_min,
+  SUM(p.ideal_rate_per_min * f.runtime_sec/60.0)  AS ideal_capacity_cnt
 FROM fact_production_min f
 LEFT JOIN dim_packaging p ON p.packaging_id = f.packaging_id
 {shift_join}
@@ -206,9 +207,10 @@ SELECT
   SUM(f.ng)                                               AS reject,
   SUM(f.runtime_sec)                                      AS runtime_sec,
   SUM(GREATEST(f.planned_sec - f.runtime_sec, 0))         AS downtime_sec,
-  COALESCE(SUM(dp.ideal_rate_per_min), 0)                 AS ideal_rate_per_min
+  MAX(p.ideal_rate_per_min)                               AS ideal_rate_per_min,
+  SUM(p.ideal_rate_per_min * f.runtime_sec/60.0)          AS ideal_capacity_cnt
 FROM fact_production_min f
-LEFT JOIN dim_packaging dp ON dp.packaging_id = f.packaging_id
+LEFT JOIN dim_packaging p ON p.packaging_id = f.packaging_id
 {shift_join}
 {where}
 GROUP BY ts_bucket
