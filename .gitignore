@@ -4,6 +4,16 @@ __pycache__/
 *.pyo
 *.pyd
 
+oee_api/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+oee_job/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 # Virtual env
 venv/
 .env/
