@@ -1,40 +1,54 @@
 @echo off
-setlocal
-REM --- thư mục dự án ---
-cd /d E:\OneDrive\Z1000_Tran_The_Tuyen\003_Partner\00_Akzo\03_MPY_OEE\00_PythonSQL
+setlocal enabledelayedexpansion
 
-REM --- kích hoạt venv ---
-call .\venv\Scripts\activate.bat
+REM ==== cấu hình cơ bản ====
+set "RUN_PARALLEL=0"                 REM 1 = chạy song song, 0 = chạy tuần tự
+set "RETENTION_DAYS=7"               REM số ngày giữ log
+set "LOGDIR=oee_job\logs"            REM thư mục log
+set "PROOT=%~dp0.."                  REM project root = thư mục cha của file .bat này
+set "VENV=%PROOT%\venv"              REM venv path
 
-REM === ENV CHO oee_job.py (ghi đè default trong file) ===
-set DB_URL=mysql+mysqlconnector://root:root@127.0.0.1:3306/mpy_oee?charset=utf8mb4
-set LINE_ID=105
-set LOOKBACK_HOURS=4
-set RUNTIME_MODE=any_change_60s
-set PYTHONUNBUFFERED=1
+REM ==== (tuỳ chọn) Env cho job Python ====
+set "DB_URL=mysql+mysqlconnector://root:root@127.0.0.1:3306/mpy_oee?charset=utf8mb4"
+set "PYTHONUNBUFFERED=1"
 
-REM --- LOG: file theo ngày + dọn log cũ ---
-set LOGDIR=oee_job/logs
+REM ==== đi tới project root & bật venv ====
+pushd "%PROOT%"
+if exist "%VENV%\Scripts\activate.bat" (
+  call "%VENV%\Scripts\activate.bat"
+)
+
+REM ==== chuẩn bị thư mục/log file theo ngày ====
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
-
 for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString(\"yyyy-MM-dd\")"') do set TODAY=%%i
-set LOGFILE=%LOGDIR%\job_%TODAY%.log
+set "LOGFILE=%LOGDIR%\job_%TODAY%.log"
+set "STATE_LOGFILE=%LOGDIR%\state_job_%TODAY%.log"
 
-set RETENTION_DAYS=7
-
-REM 1) Xoá theo TÊN file (job_YYYY-MM-DD.log)
+REM ==== dọn log cũ hơn %RETENTION_DAYS% ngày (cho cả 2 pattern) ====
 powershell -NoProfile -Command ^
-  "$cutoff=(Get-Date).AddDays(-%RETENTION_DAYS%); " ^
-  "Get-ChildItem -Path '%LOGDIR%' -Filter 'job_*.log' | ForEach-Object { " ^
-  "  if ($_.BaseName -match '^job_(\d{4}-\d{2}-\d{2})$') { " ^
-  "    $d=[datetime]::ParseExact($Matches[1],'yyyy-MM-dd',$null); " ^
-  "    if ($d -lt $cutoff) { Remove-Item $_.FullName -Force } " ^
-  "  } " ^
+  "$cutoff=(Get-Date).AddDays(-%RETENTION_DAYS%);" ^
+  "Get-ChildItem -Path '%LOGDIR%' -Filter 'job_*.log','state_job_*.log' | ForEach-Object {" ^
+  "  if ($_.LastWriteTime -lt $cutoff) { Remove-Item $_.FullName -Force }" ^
   "}"
 
-REM 2) Xoá log cũ hơn 7 ngày (điều chỉnh số ngày tuỳ ý)
-forfiles /p "%LOGDIR%" /m *.log /d -7 /c "cmd /c del @file"
+echo [INFO] %date% %time% START production job  >> "%LOGFILE%"
+echo [INFO] %date% %time% START state job       >> "%STATE_LOGFILE%"
 
-echo ==== OEE JOB start %date% %time% ====>> "%LOGFILE%"
-python -m oee_job.oee_job >> "%LOGFILE%" 2>&1
-REM python .\oee_job\oee_job.py >> "%LOGFILE%" 2>&1
+REM ==== chạy job =====
+if "%RUN_PARALLEL%"=="1" (
+  REM --- chạy song song (nền); mỗi job có log riêng
+  start "" /b cmd /c "python -m oee_job.oee_job        >> "%LOGFILE%"       2>&1"
+  start "" /b cmd /c "python -m oee_job.oee_state_job  >> "%STATE_LOGFILE%" 2>&1"
+) else (
+  REM --- chạy tuần tự (đề xuất khi cùng ghi DB)
+  python -m oee_job.oee_job        >> "%LOGFILE%"       2>&1
+  python -m oee_job.oee_state_job  >> "%STATE_LOGFILE%" 2>&1
+)
+
+echo [INFO] %date% %time% FINISH production job  >> "%LOGFILE%"
+echo [INFO] %date% %time% FINISH state job       >> "%STATE_LOGFILE%"
+
+popd
+endlocal
+
+

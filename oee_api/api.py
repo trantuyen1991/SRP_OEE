@@ -33,6 +33,7 @@ from oee_api.utils import (
 )
 from oee_api.queries import (
     build_payload,
+    build_gantt_payload,
 )
 from oee_api.schemas import Payload, Granularity
 from enum import Enum
@@ -229,6 +230,158 @@ async def get_oee_line(
     # 4) chốt hạ output theo hợp đồng
     # payload = normalize_oee_payload(payload)
     # 5) Final sanitation + response
+    logger.info("linechart payload=%s", payload)
+    payload = sanitize_json_deep(payload)
+    return JSONResponse(payload)
+
+@app.get(
+    "/oee/gantt/{line_id}",
+    response_model=Payload,
+    response_model_exclude_none=True,
+    summary="Get data for gantt chart.",
+    tags=["oee"],
+)
+
+async def get_gantt_line(
+    line_id: int = Path(..., ge=0, description="Line ID. Use 0 for Plant-level aggregation."),
+    # --- scope-first parameters ---
+    scope: Scope = Query(Scope.day, description="Time scope for view: minute/day/week/month/quarter/year/between."),
+    since_min: Optional[int] = Query(
+        SETTINGS.DEFAULT_SINCE_MIN, 
+        ge=1, 
+        description="Only when scope=minute. Lookback minutes.",
+        examples={
+            "last15":  {"summary": "Last 15 minutes", "value": 15},
+            "last240": {"summary": "Last 4 hours",    "value": 240},
+            "last720": {"summary": "Last 12 hours",   "value": 720},
+        },
+    ),
+    from_ts: Optional[str] = Query(
+        None, 
+        description="Only when scope=between. 'YYYY-MM-DD HH:MM:SS' (local)",
+        examples={
+            "startOfWindow": {"summary": "Start of range", "value": "2025-09-27 07:00:00"},
+            "monthStart":    {"summary": "Month start",   "value": "2025-09-01 00:00:00"},
+        },
+    ),
+    to_ts: Optional[str] = Query(
+        None, 
+        description="Only when scope=between. 'YYYY-MM-DD HH:MM:SS' (local)",
+        examples={
+            "endOfWindow": {"summary": "End of range", "value": "2025-09-27 11:00:00"},
+            "monthEnd":    {"summary": "Month end",    "value": "2025-09-30 23:59:59"},
+        },
+    ),
+    # filters
+    po: Optional[str] = Query(
+        None, alias="process_order",
+        description="Filter by process order (PO).",
+        examples={"samplePO": {"summary": "Example PO", "value": "PO123"}},
+    ),
+    pkg: Optional[int] = Query(
+        None, alias="packaging_id",
+        description="Filter by packaging ID.",
+        examples={"samplePkg": {"summary": "Example packaging", "value": 7}},
+    ),
+    shift_no: Optional[int] = Query(
+        None, description="Shift number filter (1,2,3…). Applies by time-of-day window.",
+        examples={"shift1": {"summary": "Shift #1", "value": 1}},
+    ),
+    # shaping
+    limit: int = Query(
+        SETTINGS.DEFAULT_LIMIT, ge=10, le=SETTINGS.HARD_MAX_LIMIT,
+        description="Max points AFTER auto-bucketing.",
+        examples={"tight": {"summary": "Cap at 120 points", "value": 120}},
+    ),
+    include: str = Query(
+        "gauges,linechart",
+        description="Comma list: gauges,linechart,summaries",
+        examples={
+            "realtime": {"summary": "Realtime board", "value": "gauges,linechart"},
+            "report":   {"summary": "Report view",    "value": "linechart,summaries"},
+            "all":      {"summary": "All parts",      "value": "gauges,linechart,summaries"},
+        },
+    ),
+    # optional auth header
+    x_api_key: Optional[str] = Header(None, convert_underscores=False),
+    # --- NEW: multi-gantt khi line_id = 0 (plant) ---
+    lines: Optional[str] = Query(
+        None, description="CSV line IDs (khi line_id=0). Ví dụ: 103,104,105"),
+    lines_mode: str = Query(
+        "top_downtime", pattern="^(all|top_downtime|top_run)$",
+        description="Cách chọn line tự động khi không truyền 'lines'"),
+    lines_limit: int = Query(8, ge=1, le=50),
+    lines_offset: int = Query(0, ge=0),
+):
+    """
+    Main OEE endpoint. Examples:
+    - /oee/line/105?scope=minute&since_min=240&include=gauges,linechart
+    - /oee/line/0?gran=between&from_ts=2025-09-20T00:00:00+07:00&to_ts=2025-09-26T23:59:59+07:00&include=linechart,summaries
+    """
+    await _check_api_key(x_api_key)
+
+    # --- resolve time window from scope ---
+    now = now_local()
+    if scope == Scope.minute:
+        m = int(since_min or SETTINGS.DEFAULT_SINCE_MIN)  # ví dụ mặc định 240 nếu bạn đang dùng
+        dt_from, dt_to = now - timedelta(minutes=m), now
+    elif scope == Scope.between:
+        if not from_ts or not to_ts:
+            raise HTTPException(status_code=400, detail="from_ts & to_ts are required when scope=between")
+        dt_from, dt_to = parse_from_to(from_ts, to_ts, since_min=240)  # bạn đã có helper này
+    elif scope == Scope.day:
+        dt_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_to = now
+    elif scope == Scope.week:
+        # tuần bắt đầu Thứ 2 00:00
+        weekday = (now.weekday() + 7) % 7  # 0=Mon
+        monday = (now - timedelta(days=weekday)).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = monday, now
+    elif scope == Scope.month:
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    elif scope == Scope.quarter:
+        q = (now.month - 1) // 3  # 0..3
+        first_month = 1 + q*3
+        first = now.replace(month=first_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    elif scope == Scope.year:
+        first = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    else:
+        # fallback an toàn
+        m = int(since_min or SETTINGS.DEFAULT_SINCE_MIN)
+        dt_from, dt_to = now - timedelta(minutes=m), now
+
+    logger.info("/oee/line start | line_id=%s scope=%s -> window %s .. %s include=%s", line_id, scope, to_local_str(dt_from), to_local_str(dt_to), include)
+
+    # map scope -> gran 
+    if scope == Scope.minute:
+        gran_for_queries = "min"
+    elif scope == Scope.between:
+        # linechart dùng auto-bucket; gran chỉ để log/summary => chọn "min" làm giá trị an toàn
+        gran_for_queries = "min"
+    else:
+        gran_for_queries = scope.value  # day/week/month/quarter/year
+
+
+    # 2) Decide which parts to include
+    include_parts: List[str] = [p.strip() for p in include.split(",") if p.strip()]
+
+    payload = await build_gantt_payload(
+        line_id=line_id,# scope=scope, since_min=since_min,
+        dt_from=dt_from, dt_to=dt_to,gran=gran_for_queries, 
+        limit=limit, bucket_sec=None,
+        include=include_parts, po=po, pkg=pkg, shift_no=shift_no,
+        # NEW
+        lines=lines, lines_mode=lines_mode,
+        lines_limit=lines_limit, lines_offset=lines_offset,
+    )
+
+    # 4) chốt hạ output theo hợp đồng
+    # payload = normalize_oee_payload(payload)
+    # 5) Final sanitation + response
+    logger.info("linechart payload=%s", payload)
     payload = sanitize_json_deep(payload)
     return JSONResponse(payload)
 

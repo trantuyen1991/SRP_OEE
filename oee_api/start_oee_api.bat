@@ -32,5 +32,5 @@ powershell -NoProfile -Command ^
 REM 2) Xoá log cũ hơn 7 ngày (điều chỉnh số ngày tuỳ ý)
 forfiles /p "%LOGDIR%" /m *.log /d -7 /c "cmd /c del @file"
 
-echo ==== OEE API start %date% %time% ====>> "%LOGFILE%"
+echo [INFO] %date% %time% ==== OEE API start ====>> "%LOGFILE%"
 python -m oee_api.api >> "%LOGFILE%" 2>&1

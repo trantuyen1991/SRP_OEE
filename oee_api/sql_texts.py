@@ -45,11 +45,12 @@ SERIES_MIN_HOUR = """
 SELECT
   FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(f.ts_min)/?)*?) AS ts_bucket,
   {line_id_expr} AS line_id,
-  SUM(f.good)                                  AS good,
-  SUM(f.ng)                                     AS reject,
-  SUM(f.runtime_sec)                            AS runtime_sec,
-  SUM(GREATEST(f.planned_sec - f.runtime_sec,0)) AS downtime_sec,
-  MAX(p.ideal_rate_per_min)                     AS ideal_rate_per_min
+  SUM(f.good)                                     AS good,
+  SUM(f.ng)                                       AS reject,
+  SUM(f.runtime_sec)                              AS runtime_sec,
+  SUM(GREATEST(f.planned_sec - f.runtime_sec,0))  AS downtime_sec,
+  MAX(p.ideal_rate_per_min)                       AS ideal_rate_per_min,
+  SUM(p.ideal_rate_per_min * f.runtime_sec/60.0)  AS ideal_capacity_cnt
 FROM fact_production_min f
 LEFT JOIN dim_packaging p ON p.packaging_id = f.packaging_id
 {shift_join}
@@ -67,11 +68,12 @@ SERIES_BY_CAL = {
         SELECT
           DATE(f.ts_min) AS ts_bucket,
           {line_id_expr} AS line_id,
-          SUM(f.good)                                  AS good,
-          SUM(f.ng)                                     AS reject,
-          SUM(f.runtime_sec)                            AS runtime_sec,
-          SUM(GREATEST(f.planned_sec - f.runtime_sec,0)) AS downtime_sec,
-          MAX(p.ideal_rate_per_min)                     AS ideal_rate_per_min
+          SUM(f.good)                                     AS good,
+          SUM(f.ng)                                       AS reject,
+          SUM(f.runtime_sec)                              AS runtime_sec,
+          SUM(GREATEST(f.planned_sec - f.runtime_sec,0))  AS downtime_sec,
+          MAX(p.ideal_rate_per_min)                       AS ideal_rate_per_min,
+          SUM(p.ideal_rate_per_min * f.runtime_sec/60.0)  AS ideal_capacity_cnt
         FROM fact_production_min f
         LEFT JOIN dim_packaging p ON p.packaging_id = f.packaging_id
         {shift_join}
@@ -183,6 +185,7 @@ SELECT
   {line_id_expr} AS line_id,
   SUM(f.good)                                     AS good,
   SUM(f.ng)                                       AS reject,
+  SUM(f.planned_sec)                              AS planned_sec,
   SUM(f.runtime_sec)                              AS runtime_sec,
   SUM(GREATEST(f.planned_sec - f.runtime_sec,0))  AS downtime_sec,
   MAX(p.ideal_rate_per_min)                       AS ideal_rate_per_min,
@@ -205,6 +208,7 @@ SELECT
   {line_id_expr}                                          AS line_id,
   SUM(f.good)                                             AS good,
   SUM(f.ng)                                               AS reject,
+  SUM(f.planned_sec)                                      AS planned_sec,
   SUM(f.runtime_sec)                                      AS runtime_sec,
   SUM(GREATEST(f.planned_sec - f.runtime_sec, 0))         AS downtime_sec,
   MAX(p.ideal_rate_per_min)                               AS ideal_rate_per_min,
@@ -216,4 +220,106 @@ LEFT JOIN dim_packaging p ON p.packaging_id = f.packaging_id
 GROUP BY ts_bucket
 ORDER BY ts_bucket
 LIMIT ?
+""".strip()
+
+RACE = """
+SELECT 
+    e.reason_id,
+    COALESCE(r.reason_code, '0')        AS reason_code,
+    COALESCE(r.reason_name, 'Unknown')  AS reason_name,
+    COALESCE(r.reason_group, 'Unknown') AS reason_group,
+    SUM(e.duration_sec)                 AS total_downtime_sec
+FROM fact_state_event e
+LEFT JOIN dim_reason r ON r.reason_id = e.reason_id
+WHERE
+    -- overlap window (đừng dùng start>=from AND end<=to)
+    e.start_ts < :to_ts
+    AND e.end_ts  > :from_ts
+    AND (:line_id = 0 OR e.line_id = :line_id)   -- 0 = toàn plant
+    AND e.state_id NOT IN (1, 5)            -- loại RUN (1) và IDLE (5)
+GROUP BY
+    e.reason_id, r.reason_code, r.reason_name, r.reason_group
+ORDER BY total_downtime_sec DESC
+LIMIT :limit;
+""".strip()
+
+GANTT = """
+SELECT
+    e.event_id,
+    e.line_id,
+    e.state_id,
+    s.state_code,
+    e.reason_id,
+    COALESCE(r.reason_code, '0')        AS reason_code,
+    COALESCE(r.reason_name, 'Unknown')  AS reason_name,
+    COALESCE(r.reason_group, 'Unknown') AS reason_group,
+    e.start_ts,
+    e.end_ts,
+    e.duration_sec,
+    e.note
+FROM fact_state_event e
+JOIN dim_state  s ON s.state_id = e.state_id
+LEFT JOIN dim_reason r ON r.reason_id = e.reason_id
+WHERE
+    e.start_ts < :to_ts
+    AND e.end_ts  > :from_ts
+    AND (:line_id = 0 OR e.line_id = :line_id)
+ORDER BY e.start_ts
+LIMIT :limit OFFSET :offset;
+""".strip()
+# --- NEW: chọn line theo tổng downtime / run trong cửa sổ ---
+LINES_TOP_DOWNTIME = """
+SELECT
+  e.line_id,
+  SUM(CASE WHEN e.state_id NOT IN (1,5) THEN e.duration_sec ELSE 0 END) AS downtime_sec
+FROM fact_state_event e
+WHERE e.start_ts < :to_ts AND e.end_ts > :from_ts
+GROUP BY e.line_id
+ORDER BY downtime_sec DESC
+LIMIT :lines_limit OFFSET :lines_offset
+""".strip()
+
+LINES_TOP_RUN = """
+SELECT
+  e.line_id,
+  SUM(CASE WHEN e.state_id = 1 THEN e.duration_sec ELSE 0 END) AS run_sec
+FROM fact_state_event e
+WHERE e.start_ts < :to_ts AND e.end_ts > :from_ts
+GROUP BY e.line_id
+ORDER BY run_sec DESC
+LIMIT :lines_limit OFFSET :lines_offset
+""".strip()
+
+LINES_ALL_IN_WINDOW = """
+SELECT DISTINCT e.line_id
+FROM fact_state_event e
+WHERE e.start_ts < :to_ts AND e.end_ts > :from_ts
+ORDER BY e.line_id
+LIMIT :lines_limit OFFSET :lines_offset
+""".strip()
+
+# --- NEW: Gantt cho 1 line (độc lập template cũ) ---
+GANTT_SEGMENTS_SIMPLE = """
+SELECT
+  e.event_id,
+  e.line_id,
+  e.state_id,
+  s.state_code,
+  e.reason_id,
+  COALESCE(r.reason_code, '0')         AS reason_code,
+  COALESCE(r.reason_name, 'Unknown')   AS reason_name,
+  GREATEST(e.start_ts, :from_ts)       AS start_ts,
+  LEAST(e.end_ts,   :to_ts)            AS end_ts,
+  TIMESTAMPDIFF(SECOND,
+    GREATEST(e.start_ts, :from_ts),
+    LEAST(e.end_ts,   :to_ts))         AS duration_sec,
+  e.note
+FROM fact_state_event e
+JOIN dim_state  s ON s.state_id  = e.state_id
+LEFT JOIN dim_reason r ON r.reason_id = e.reason_id
+WHERE
+  e.start_ts < :to_ts AND e.end_ts > :from_ts
+  AND e.line_id = :line_id
+ORDER BY e.start_ts
+LIMIT :limit OFFSET :offset
 """.strip()

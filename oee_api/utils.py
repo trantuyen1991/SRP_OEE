@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from oee_api.config import SETTINGS
 import logging
 import os, time, threading
+
 # ---------------- Time helpers ----------------
 
 def tz() -> ZoneInfo:
@@ -26,21 +27,6 @@ def now_local() -> datetime:
 def to_iso8601(dt: datetime) -> str:
     return dt.astimezone(tz()).isoformat(timespec="seconds")
 
-# def to_local_str(dt: datetime) -> str:
-    """
-    Trả 'YYYY-MM-DD HH:MM:SS' theo múi giờ local, KHÔNG kèm offset.
-    - Nếu dt là pandas.Timestamp -> đổi sang datetime
-    - Nếu dt naive: coi như đã là local -> format thẳng
-    - Nếu dt aware: convert về local tz rồi format
-    """
-    if dt is None:
-        return None
-    if isinstance(dt, pd.Timestamp):
-        dt = dt.to_pydatetime()
-    if dt.tzinfo is None:
-        # naive => coi là local time
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    return dt.astimezone(tz()).strftime("%Y-%m-%d %H:%M:%S")
 def to_local_str(dt: datetime) -> str:
     """
     Format 'YYYY-MM-DD HH:MM:SS' theo múi giờ local, KHÔNG kèm offset.
@@ -155,7 +141,6 @@ def choose_bucket_seconds(span_seconds: int, limit: int, gran: str, override: Op
 # ---------------- OEE calculations ----------------
 @dataclass
 class OeeInputs:
-    line_id:int
     good: float
     reject: float
     runtime_sec: float
@@ -164,45 +149,46 @@ class OeeInputs:
     # NEW: tổng công suất lý thuyết (đã nhân theo runtime từng line)
     ideal_capacity_cnt: Optional[float] = None
 
-def compute_oee(inp: OeeInputs) -> dict:
-    """Compute A/P/Q/OEE using a pragmatic formula consistent with your notes.
-    Availability = runtime / (runtime + downtime)
-    Performance  = total_output / (runtime_min * ideal_rate_per_min) if rate available else None
-    Quality      = good / (good + reject) when denom>0
+def compute_oee(df: pd.DataFrame) -> pd.DataFrame:
     """
-    total = (inp.good or 0) + (inp.reject or 0)
-    run = inp.runtime_sec or 0
-    down = inp.downtime_sec or 0
-    plan = run + down if (run is not None and down is not None) else None
+    Vectorized OEE metrics for any scope (plant/line).
+    Requires columns: good, ng, runtime_sec, planned_sec, ideal_capacity_cnt.
+    Returns df with columns: availability, performance, quality, oee.
+    NaN/None -> 0.0
+    """
+    s = df.copy()
 
-    availability = (run / plan) if plan and plan > 0 else None
-    performance = None
-    if inp.line_id == 0: # plant-level:
-        if inp.ideal_capacity_cnt and inp.ideal_capacity_cnt > 0 and run and run > 0:
-            performance = (total / inp.ideal_capacity_cnt)
-    else:   #line-level:
-        if inp.ideal_rate_per_min and inp.ideal_rate_per_min > 0 and run and run > 0:
-            performance = (total / ((run / 60.0) * inp.ideal_rate_per_min))
-    quality = (inp.good / total) if total > 0 else None
+    # Chuẩn hóa cột
+    for c in ("good","runtime_sec","planned_sec","ideal_capacity_cnt"):
+        if c not in s.columns: s[c] = 0
+        s[c] = pd.to_numeric(s[c], errors="coerce").fillna(0)
 
-    def pct(x) -> Optional[float]:
-        if x is None:
-            return 0.0
-        try:
-            return round(float(x) * 100.0, 2)
-        except Exception:
-            return 0.0
+    # 'reject' có thể tên 'reject' hoặc 'ng' tùy truy vấn
+    if "reject" in s.columns:
+        rej = pd.to_numeric(s["reject"], errors="coerce").fillna(0)
+    else:
+        rej = pd.to_numeric(s.get("ng", 0), errors="coerce").fillna(0)
 
-    oee = None
-    if availability is not None and performance is not None and quality is not None:
-        oee = availability * performance * quality
+    good = pd.to_numeric(s["good"], errors="coerce").fillna(0)
+    produced = good + rej
 
-    return {
-        "availability": pct(availability),
-        "performance": pct(performance),
-        "quality": pct(quality),
-        "oee": pct(oee),
-    }
+    runtime_min = s["runtime_sec"] / 60.0
+    planned_min = s["planned_sec"] / 60.0
+
+    # Availability
+    avail = np.where(planned_min > 0, runtime_min / planned_min, 0.0)
+    # Performance (CHUẨN): dùng tổng sản lượng
+    perf  = np.where(s["ideal_capacity_cnt"] > 0, produced / s["ideal_capacity_cnt"], 0.0)
+    # Quality (CHUẨN): good / (good + reject)
+    qual  = np.where(produced > 0, good / produced, 0.0)
+
+    oee = avail * perf * qual
+
+    s["availability"] = np.clip(np.nan_to_num(100.0 * avail), 0.0, None)
+    s["performance"]  = np.clip(np.nan_to_num(100.0 * perf),  0.0, None)
+    s["quality"]      = np.clip(np.nan_to_num(100.0 * qual),  0.0, None)
+    s["oee"]          = np.clip(np.nan_to_num(100.0 * oee),   0.0, None)
+    return s
 
 # ---- OEE payload normalizer -------------------------------------------------
 def normalize_oee_payload(payload: dict) -> dict:
@@ -335,3 +321,23 @@ class TTLCache:
                 if len(self._store) >= self.maxsize:
                     self._store.pop(next(iter(self._store)), None)
             self._store[key] = (exp, value)
+# --- NEW: parse CSV -> list[int] ---
+def parse_csv_int(s: str | None) -> list[int]:
+    if not s:
+        return []
+    out = []
+    for tok in str(s).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except Exception:
+            continue
+    # bỏ trùng và giữ thứ tự
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq

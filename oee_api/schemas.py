@@ -2,9 +2,15 @@
 from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel, Field, ConfigDict
+from enum import Enum
 
 # Granularity “khóa hợp đồng” với FE (enum)
 Granularity = Literal["min", "hour", "day", "week", "month", "quarter", "year", "shift"]
+
+class Scope(str, Enum):
+    # NO 'shift' in Scope
+    plant = "plant"
+    line = "line"
 
 class MetaParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
