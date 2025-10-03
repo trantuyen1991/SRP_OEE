@@ -19,3 +19,8 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+# Ignore log files
+*.log
+logs/
+oee_job/logs/
+oee_api/logs/
