@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from oee_api.config import SETTINGS
 import logging
 import os, time, threading
+from enum import Enum
 
 # ---------------- Time helpers ----------------
 
@@ -148,6 +149,19 @@ class OeeInputs:
     ideal_rate_per_min: Optional[float]  # may be None
     # NEW: tổng công suất lý thuyết (đã nhân theo runtime từng line)
     ideal_capacity_cnt: Optional[float] = None
+
+class Scope(str, Enum):
+    minute = "minute"
+    day = "day"
+    week = "week"
+    month = "month"
+    quarter = "quarter"
+    year = "year"
+    between = "between"
+
+class CompareMode(str, Enum):
+    none = "none"
+    prev = "prev"
 
 def compute_oee(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -341,3 +355,107 @@ def parse_csv_int(s: str | None) -> list[int]:
             seen.add(x)
             uniq.append(x)
     return uniq
+
+def caculate_dt_from_to(scope,since_min,from_ts,to_ts,HTTPException):
+    now = now_local()
+    if scope == Scope.minute:
+        m = int(since_min or SETTINGS.DEFAULT_SINCE_MIN)  # ví dụ mặc định 240 nếu bạn đang dùng
+        dt_from, dt_to = now - timedelta(minutes=m), now
+    elif scope == Scope.between:
+        if not from_ts or not to_ts:
+            raise HTTPException(status_code=400, detail="from_ts & to_ts are required when scope=between")
+        dt_from, dt_to = parse_from_to(from_ts, to_ts, since_min=240)  # bạn đã có helper này
+    elif scope == Scope.day:
+        dt_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_to = now
+    elif scope == Scope.week:
+        # tuần bắt đầu Thứ 2 00:00
+        weekday = (now.weekday() + 7) % 7  # 0=Mon
+        monday = (now - timedelta(days=weekday)).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = monday, now
+    elif scope == Scope.month:
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    elif scope == Scope.quarter:
+        q = (now.month - 1) // 3  # 0..3
+        first_month = 1 + q*3
+        first = now.replace(month=first_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    elif scope == Scope.year:
+        first = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        dt_from, dt_to = first, now
+    else:
+        # fallback an toàn
+        m = int(since_min or SETTINGS.DEFAULT_SINCE_MIN)
+        dt_from, dt_to = now - timedelta(minutes=m), now
+
+    # map scope -> gran 
+    if scope == Scope.minute:
+        gran = "min"
+    elif scope == Scope.between:
+        gran = "min"
+    else:
+        gran = scope.value  # day/week/month/quarter/year
+
+    return dt_from, dt_to, gran
+
+# === Gran & previous-window helpers =========================================
+def infer_gran_from_scope(scope: str) -> str:
+    """
+    scope -> gran:
+      - 'minute' và 'between'  => gran = 'min'
+      - còn lại: gran = scope (day/week/month/quarter/year)
+    """
+    s = (scope or "").lower()
+    if s in ("minute", "between"):
+        return "min"
+    return s
+
+def previous_window(gran: str, start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """
+    Trả về cửa sổ liền kề trước [start, end) theo scope.
+    minute/between: lùi đúng một khoảng thời gian (delta = end-start).
+    day/week/month/quarter/year: lùi 1 đơn vị lịch tương ứng.
+    """
+    s = (gran or "").lower()
+    if s == "min":
+        delta = end - start
+        return (start - delta, end - delta)
+
+    # đơn vị lịch
+    if s == "day":
+        delta = timedelta(days=1)
+        return (start - delta, end - delta)
+    if s == "week":
+        delta = timedelta(weeks=1)
+        return (start - delta, end - delta)
+    if s == "month":
+        # lùi 1 tháng đơn giản (an toàn: rơi về ngày 1)
+        a = start.replace(day=1)
+        b = end.replace(day=1)
+        prev_a_month = (a.month - 2) % 12 + 1
+        prev_b_month = (b.month - 2) % 12 + 1
+        prev_a_year  = a.year - (1 if a.month == 1 else 0)
+        prev_b_year  = b.year - (1 if b.month == 1 else 0)
+        prev_start = a.replace(year=prev_a_year, month=prev_a_month)
+        prev_end   = b.replace(year=prev_b_year, month=prev_b_month)
+        return (prev_start, prev_end)
+    if s == "quarter":
+        # quy ước q1 bắt đầu 01-01; lùi 1 quý
+        def minus_quarter(d: datetime) -> datetime:
+            q = ( (d.month-1)//3 )  # 0..3
+            y = d.year
+            q -= 1
+            if q < 0:
+                q += 4; y -= 1
+            m = 1 + 3*q
+            return d.replace(year=y, month=m, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return (minus_quarter(start), minus_quarter(end))
+    if s == "year":
+        prev_start = start.replace(year=start.year-1)
+        prev_end   = end.replace(year=end.year-1)
+        return (prev_start, prev_end)
+
+    # fallback
+    delta = end - start
+    return (start - delta, end - delta)
